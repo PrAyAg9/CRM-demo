@@ -1,0 +1,174 @@
+version: "3.8"
+
+services:
+  # MongoDB Database
+  mongodb:
+    image: mongo:6.0
+    container_name: mini-crm-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-password123}
+      MONGO_INITDB_DATABASE: ${MONGO_DB_NAME:-mini_crm}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - mini-crm-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: mini-crm-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis123}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - mini-crm-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mini-crm-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-password123}@mongodb:27017/${MONGO_DB_NAME:-mini_crm}?authSource=admin
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis123}@redis:6379
+      JWT_SECRET: ${JWT_SECRET:-your-super-secret-jwt-key-change-this-in-production}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EMAIL_SERVICE: ${EMAIL_SERVICE:-gmail}
+      EMAIL_USER: ${EMAIL_USER}
+      EMAIL_PASS: ${EMAIL_PASS}
+      SMS_SERVICE: ${SMS_SERVICE:-twilio}
+      SMS_ACCOUNT_SID: ${SMS_ACCOUNT_SID}
+      SMS_AUTH_TOKEN: ${SMS_AUTH_TOKEN}
+      SMS_PHONE_NUMBER: ${SMS_PHONE_NUMBER}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:80}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:80}
+    ports:
+      - "3000:3000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mini-crm-network
+    volumes:
+      - ./backend/uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Frontend Application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: mini-crm-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - mini-crm-network
+    volumes:
+      - ./ssl:/etc/nginx/ssl:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Nginx Load Balancer (for scaling)
+  nginx-lb:
+    image: nginx:alpine
+    container_name: mini-crm-nginx-lb
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx-lb.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - mini-crm-network
+    profiles:
+      - load-balancer
+
+  # Database Admin (MongoDB Express)
+  mongo-express:
+    image: mongo-express:latest
+    container_name: mini-crm-mongo-express
+    restart: unless-stopped
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_ROOT_USERNAME:-admin}
+      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_ROOT_PASSWORD:-password123}
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-password123}@mongodb:27017/
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USER:-admin}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASS:-pass}
+    ports:
+      - "8081:8081"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - mini-crm-network
+    profiles:
+      - admin
+
+  # Redis Admin (RedisInsight)
+  redis-insight:
+    image: redislabs/redisinsight:latest
+    container_name: mini-crm-redis-insight
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - redis_insight_data:/db
+    networks:
+      - mini-crm-network
+    profiles:
+      - admin
+
+volumes:
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+  redis_insight_data:
+    driver: local
+
+networks:
+  mini-crm-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

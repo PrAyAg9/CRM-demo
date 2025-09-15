@@ -1,0 +1,250 @@
+# Production Docker Compose Configuration
+version: "3.8"
+
+services:
+  # MongoDB Database with replica set for production
+  mongodb:
+    image: mongo:6.0
+    container_name: mini-crm-mongodb-prod
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGO_DB_NAME}
+    volumes:
+      - mongodb_data:/data/db
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+      - ./backups:/backups
+    networks:
+      - mini-crm-network
+    command: --replSet rs0 --keyFile /etc/mongo-keyfile --bind_ip_all
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # Redis Cluster for production
+  redis:
+    image: redis:7-alpine
+    container_name: mini-crm-redis-prod
+    restart: always
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD} --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      - mini-crm-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+
+  # Backend API with production optimizations
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: mini-crm-backend-prod
+    restart: always
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGO_DB_NAME}?authSource=admin&replicaSet=rs0
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EMAIL_SERVICE: ${EMAIL_SERVICE}
+      EMAIL_USER: ${EMAIL_USER}
+      EMAIL_PASS: ${EMAIL_PASS}
+      SMS_SERVICE: ${SMS_SERVICE}
+      SMS_ACCOUNT_SID: ${SMS_ACCOUNT_SID}
+      SMS_AUTH_TOKEN: ${SMS_AUTH_TOKEN}
+      SMS_PHONE_NUMBER: ${SMS_PHONE_NUMBER}
+      FRONTEND_URL: ${FRONTEND_URL}
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-900000}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-100}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mini-crm-network
+    volumes:
+      - ./backend/uploads:/app/uploads
+      - ./logs:/app/logs
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # Frontend with SSL/TLS termination
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    container_name: mini-crm-frontend-prod
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - mini-crm-network
+    volumes:
+      - ./ssl:/etc/nginx/ssl:ro
+      - ./logs/nginx:/var/log/nginx
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  # Application monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mini-crm-prometheus
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+    networks:
+      - mini-crm-network
+    profiles:
+      - monitoring
+
+  # Metrics visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mini-crm-grafana
+    restart: always
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana-datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - mini-crm-network
+    profiles:
+      - monitoring
+
+  # Log aggregation
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.5.0
+    container_name: mini-crm-elasticsearch
+    restart: always
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - mini-crm-network
+    profiles:
+      - logging
+
+  # Log processing
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.5.0
+    container_name: mini-crm-logstash
+    restart: always
+    volumes:
+      - ./logging/logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+      - ./logs:/logs:ro
+    depends_on:
+      - elasticsearch
+    networks:
+      - mini-crm-network
+    profiles:
+      - logging
+
+  # Log visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.5.0
+    container_name: mini-crm-kibana
+    restart: always
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - mini-crm-network
+    profiles:
+      - logging
+
+  # Backup service
+  backup:
+    image: alpine:latest
+    container_name: mini-crm-backup
+    restart: "no"
+    volumes:
+      - mongodb_data:/data/mongodb:ro
+      - redis_data:/data/redis:ro
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    command: /backup.sh
+    networks:
+      - mini-crm-network
+    profiles:
+      - backup
+
+volumes:
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+
+networks:
+  mini-crm-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16

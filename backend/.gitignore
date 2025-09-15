@@ -1,0 +1,34 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# production
+/build
+/dist
+/tmp
+/yarn-error.log
+
+# misc
+npm-debug.log*
+yarn-debug.log*
+
+# environment variables
+.env
+.env.production
+.env.local
+.env.development
+.env.test
+
+# editor directories and files
+.idea/
+.vscode/
+*.swp
+*~
+
+# global configuration files
+.bashrc
+.profile
+.zshrc
+.bash_profile
+.gitignore_global
